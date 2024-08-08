@@ -4,9 +4,16 @@ from fastapi.responses import JSONResponse
 from packaging import version
 from functools import cache
 from http import HTTPStatus
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, UsageInfo
+from vllm.entrypoints.openai.protocol import (
+    random_uuid,
+    UsageInfo,
+    ToolCall,
+    ChatCompletionLogProbs,
+    OpenAIBaseModel,
+    StreamOptions,
+)
 from vllm.entrypoints.openai import cli_args
-import importlib
+from vllm.entrypoints.openai.cli_context_args import cliContext
 import time
 
 try:
@@ -17,17 +24,26 @@ try:
     _fastchat_available = True
 except ImportError:
     _fastchat_available = False
+    Conversation = None
+    SeparatorStyle = None
 
 # vllm:0.2.7
 try:
     from vllm.entrypoints.openai.serving_engine import OpenAIServing
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    from vllm.utils import FlexibleArgumentParser
+
 except ImportError:
     OpenAIServing = None
+    OpenAIServingChat = None
+    FlexibleArgumentParser = None
 
 
+# class ChatMessageEx(OpenAIBaseModel):
 class ChatMessageEx(BaseModel):
     role: Optional[str] = "assistant"
     content: Optional[str] = ""
+    tool_calls: List[ToolCall] = Field(default_factory=list)
 
     @validator("role")
     @classmethod
@@ -37,15 +53,17 @@ class ChatMessageEx(BaseModel):
         return value
 
 
-class ChatCompletionResponseChoiceEx(BaseModel):
+class ChatCompletionResponseChoiceEx(OpenAIBaseModel):
     index: int
     message: ChatMessageEx
-    finish_reason: Optional[Literal["stop", "length"]] = None
+    logprobs: Optional[ChatCompletionLogProbs] = None
+    finish_reason: Optional[str] = None
+    stop_reason: Optional[Union[int, str]] = None
 
 
-class ChatCompletionResponseEx(BaseModel):
+class ChatCompletionResponseEx(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
-    object: str = "chat.completion"
+    object: Literal["chat.completion"] = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionResponseChoiceEx]
@@ -56,7 +74,7 @@ def get_conversation_stop(conv: Conversation):
     conv_name = conv.name
     if conv_name == "qwen-7b-chat":
         return ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
-    if not hasattr(conv, 'stop_str'):
+    if not hasattr(conv, "stop_str"):
         return
     return conv.stop_str
 
@@ -66,38 +84,83 @@ def get_conversation_stop_token_ids(conv: Conversation):
     # if conv_name == "Yi-34b-chat":
     #     return [7, ]
 
-    if not hasattr(conv, 'stop_token_ids'):
+    if not hasattr(conv, "stop_token_ids"):
         return
     return conv.stop_token_ids
 
 
 @cache
 def get_default_model_template():
-    from vllm.entrypoints.openai.cli_context_args import cliContext
+
     args = cliContext.args
     if not args:
         return
-    default_model_template = getattr(args, 'default_model_template', None)
-    print('default_model_template', default_model_template)
+    default_model_template = getattr(args, "default_model_template", None)
+    print("default_model_template", default_model_template)
     return default_model_template
+
+
+@cache
+def get_stream_include_usage_status():
+    args = cliContext.args
+    if not args:
+        return None  # Return None or an appropriate default value if there are no arguments
+    stream_include_usage = getattr(args, "enable_stream_include_usage", False)
+    # print("Stream Include Usage Status:", stream_include_usage)
+    return stream_include_usage
+
+
+@cache
+def get_continuous_usage_stats_status():
+    args = cliContext.args
+    if not args:
+        return None  # Return None or an appropriate default value if there are no arguments
+    continuous_usage_stats_disabled = getattr(
+        args, "disable_continuous_usage_stats", False
+    )
+    # print("Continuous Usage Stats Disabled Status:", continuous_usage_stats_disabled)
+    return continuous_usage_stats_disabled
 
 
 async def patch_check_model(request) -> Optional[JSONResponse]:
     from vllm.entrypoints.openai.api_server import origin_check_model
+
     ret = await origin_check_model(request)
     reset_default_request(request=request)
     return ret
 
+
 origin_make_arg_parser = cli_args.make_arg_parser
+
 
 def patch_make_arg_parser(*args):
     parser = origin_make_arg_parser(*args)
-    parser.add_argument("--default-model-template",
-                        type=str,
-                        default=None,
-                        help="model template")
+    parser.add_argument(
+        "--default-model-template", type=str, default=None, help="model template"
+    )
+
+    parser.add_argument(
+        "--enable-stream-include-usage",
+        action="store_true",
+        help="Enable the inclusion of stream usage data in the output, useful for monitoring performance.",
+    )
+
+    parser.add_argument(
+        "--disable-continuous-usage-stats",
+        action="store_true",
+        help="Disable the continuous collection and reporting of usage statistics to improve performance.",
+    )
+
     return parser
-    
+
+
+def _patch_parse_args(self, *args, **kwargs):
+    args = self._origin_parse_args(*args, **kwargs)
+    print("_patch_parse_args Parsed Arguments:", args)
+    cliContext.args = args
+    return args
+
+
 async def origin_serving_self_check_model(self, request):
     # if request.model == self.served_model:
     #     return
@@ -106,14 +169,29 @@ async def origin_serving_self_check_model(self, request):
     #     err_type="NotFoundError",
     #     status_code=HTTPStatus.NOT_FOUND)
 
+    # if request.model in self.served_model_names:
+    #     return None
+    # # if request.model in [lora.lora_name for lora in self.lora_requests]:
+    # #     return None
+    # return self.create_error_response(
+    #     message=f"The model `{request.model}` does not exist.",
+    #     err_type="NotFoundError",
+    #     status_code=HTTPStatus.NOT_FOUND)
+
     if request.model in self.served_model_names:
         return None
-    # if request.model in [lora.lora_name for lora in self.lora_requests]:
-    #     return None
+    if request.model in [lora.lora_name for lora in self.lora_requests]:
+        return None
+    if request.model in [
+        prompt_adapter.prompt_adapter_name
+        for prompt_adapter in self.prompt_adapter_requests
+    ]:
+        return None
     return self.create_error_response(
         message=f"The model `{request.model}` does not exist.",
         err_type="NotFoundError",
-        status_code=HTTPStatus.NOT_FOUND)
+        status_code=HTTPStatus.NOT_FOUND,
+    )
 
 
 async def patch_serving_self_check_model(self, request):
@@ -128,6 +206,25 @@ def reset_default_request(request):
     Args:
         request (_type_): _description_
     """
+
+    # v0.5.4
+    include_usage_status = get_stream_include_usage_status()
+    if include_usage_status:
+        # 为了符合openai的规范，默认接口不传的情况下不返回usage 可以启动默认参数--default-stream-include-usage 强制开启
+        if get_continuous_usage_stats_status():
+            continuous_usage_stats = False
+        else:
+            continuous_usage_stats = True
+            
+        if request.stream_options is None:
+            request.stream_options = StreamOptions(include_usage=True, continuous_usage_stats=continuous_usage_stats)
+        # if not request.stream_options.include_usage:
+        #     request.stream_options.include_usage = False
+        # else:
+        #     request.stream_options.include_usage = True
+
+
+    # 没有安装fschat 跳过设置stop
     if not _fastchat_available:
         return
 
@@ -146,7 +243,6 @@ def reset_default_request(request):
         # print(_stop_token_ids)
         if _stop_token_ids:
             request.stop_token_ids = list(_stop_token_ids)
-    # print("end")
 
 
 async def patch_get_gen_prompt(request) -> str:
@@ -158,7 +254,8 @@ async def patch_get_gen_prompt(request) -> str:
     if version.parse(fastchat.__version__) < version.parse("0.2.23"):
         raise ImportError(
             f"fastchat version is low. Current version: {fastchat.__version__} "
-            "Please upgrade fastchat to use: `$ pip install -U fschat`")
+            "Please upgrade fastchat to use: `$ pip install -U fschat`"
+        )
     default_model_template = get_default_model_template()
     model_name = default_model_template if default_model_template else request.model
     conv = get_conversation_template(model_name)
@@ -205,6 +302,7 @@ async def patch_get_gen_prompt(request) -> str:
 def patch_api_server():
     # print("load monkey_patch_api_request_v4")
     from vllm.entrypoints.openai import protocol
+
     protocol.ChatMessage = ChatMessageEx
     protocol.ChatCompletionResponseChoice = ChatCompletionResponseChoiceEx
     protocol.ChatCompletionResponse = ChatCompletionResponseEx
@@ -220,8 +318,12 @@ def patch_api_server():
         api_server.check_model = patch_check_model
 
     if OpenAIServing:
-        OpenAIServing.origin_serving_check_model = origin_serving_self_check_model
+        # OpenAIServing.origin_serving_check_model = origin_serving_self_check_model
+        OpenAIServing.origin_serving_check_model = OpenAIServing._check_model
         OpenAIServing._check_model = patch_serving_self_check_model
-        
-    cli_args.make_arg_parser = patch_make_arg_parser
 
+    if FlexibleArgumentParser:
+        FlexibleArgumentParser._origin_parse_args = FlexibleArgumentParser.parse_args
+        FlexibleArgumentParser.parse_args = _patch_parse_args
+
+    cli_args.make_arg_parser = patch_make_arg_parser
