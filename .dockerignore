@@ -1,4 +1,6 @@
 vllm/*.so
-
+/.venv
+/build
+dist
 # Ignore deploy_docker
 deploy_docker/
