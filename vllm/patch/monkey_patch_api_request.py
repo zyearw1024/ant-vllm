@@ -12,6 +12,7 @@ from vllm.entrypoints.openai.protocol import (
     OpenAIBaseModel,
     StreamOptions,
 )
+from vllm.sequence import Logprob
 from vllm.entrypoints.openai import cli_args
 from vllm.entrypoints.openai.cli_context_args import cliContext
 import time
@@ -57,7 +58,9 @@ class ChatCompletionResponseChoiceEx(OpenAIBaseModel):
     index: int
     message: ChatMessageEx
     logprobs: Optional[ChatCompletionLogProbs] = None
-    finish_reason: Optional[str] = None
+    # per OpenAI spec this is the default
+    finish_reason: Optional[str] = "stop"
+    # not part of the OpenAI spec but included in vLLM for legacy reasons
     stop_reason: Optional[Union[int, str]] = None
 
 
@@ -68,6 +71,7 @@ class ChatCompletionResponseEx(OpenAIBaseModel):
     model: str
     choices: List[ChatCompletionResponseChoiceEx]
     usage: UsageInfo
+    prompt_logprobs: Optional[List[Optional[Dict[int, Logprob]]]] = None
 
 
 def get_conversation_stop(conv: Conversation):
@@ -301,11 +305,11 @@ async def patch_get_gen_prompt(request) -> str:
 
 def patch_api_server():
     # print("load monkey_patch_api_request_v4")
-    from vllm.entrypoints.openai import protocol
+    # from vllm.entrypoints.openai import protocol
 
-    protocol.ChatMessage = ChatMessageEx
-    protocol.ChatCompletionResponseChoice = ChatCompletionResponseChoiceEx
-    protocol.ChatCompletionResponse = ChatCompletionResponseEx
+    # protocol.ChatMessage = ChatMessageEx
+    # protocol.ChatCompletionResponseChoice = ChatCompletionResponseChoiceEx
+    # protocol.ChatCompletionResponse = ChatCompletionResponseEx
     try:
         from vllm.entrypoints.openai.api_server import check_model as origin_check_model
     except ImportError:
