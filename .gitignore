@@ -204,3 +204,4 @@ deploy_docker/
 
 # Linting
 actionlint
+shellcheck*/
