@@ -304,7 +304,7 @@ async def patch_get_gen_prompt(request) -> str:
 
 
 def patch_api_server():
-    # print("load monkey_patch_api_request_v4")
+    print("load monkey_patch_api_request_v4")
     # from vllm.entrypoints.openai import protocol
 
     # protocol.ChatMessage = ChatMessageEx
