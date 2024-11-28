@@ -1,10 +1,10 @@
 from vllm.patch.monkey_patch_api_request import patch_api_server;patch_api_server()
+import asyncio
 
 from vllm.entrypoints.openai.api_server import (
     make_arg_parser,
     run_server,
-    FlexibleArgumentParser,
-    uvloop,
+    FlexibleArgumentParser
 )
 
 if __name__ == "__main__":
@@ -15,4 +15,4 @@ if __name__ == "__main__":
     parser = make_arg_parser(parser)
     args = parser.parse_args()
 
-    uvloop.run(run_server(args))
+    asyncio.run(run_server(args))
