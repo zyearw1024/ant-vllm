@@ -173,8 +173,9 @@ def get_default_stop_token_ids() -> Optional[list]:
 
 
 async def patch_check_model(request) -> Optional[JSONResponse]:
-    """Patch for check_model in versions < 0.6.2"""
-    if version.parse(vllm_version) < version.parse("0.6.2"):
+    """Patch for check_model in versions < 0.6.0"""
+    print("Patch for check_model in versions < 0.6.0")
+    if version.parse(vllm_version) < version.parse("0.6.0"):
         from vllm.entrypoints.openai.api_server import origin_check_model
 
     ret = await origin_check_model(request)
@@ -183,7 +184,8 @@ async def patch_check_model(request) -> Optional[JSONResponse]:
 
 
 async def patch_check_model_v2(self, request):
-    """Patch for check_model in versions >= 0.6.2"""
+    """Patch for check_model in versions >= 0.6.0"""
+    print("Patch for check_model in versions >= 0.6.0")
     ret = await self.origin_check_model(request)
     reset_default_request(request=request)
     return ret
@@ -343,29 +345,35 @@ def patch_api_server() -> None:
     """Apply patches to VLLM API server components based on version"""
 
     print("load monkey_patch_api_request_v4")
+    print("vllm_version", vllm_version)
 
     try:
-        if vllm_version_magic.less_than_0_6_2():
+        if vllm_version_magic.less_than_0_2_7():
             from vllm.entrypoints.openai.api_server import (
                 check_model as origin_check_model,
             )
-
             OpenAIServingChat = None
+        elif vllm_version_magic.less_than_0_6_2():
+            from vllm.entrypoints.openai.serving_engine import OpenAIServing as OpenAIServingChat
+
+            origin_check_model = OpenAIServingChat._check_model
+            OpenAIServingChat.origin_check_model = origin_check_model
         else:
             from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 
             origin_check_model = OpenAIServingChat._check_model
             OpenAIServingChat.origin_check_model = origin_check_model
+            
     except ImportError:
         origin_check_model = None
 
     from vllm.entrypoints.openai import api_server
 
-    if origin_check_model and vllm_version_magic.less_than_0_6_2():
+    if origin_check_model and vllm_version_magic.less_than_0_2_7():
         api_server.origin_check_model = origin_check_model
         api_server.check_model = patch_check_model
-
-    if vllm_version_magic.greater_than_or_equal_0_6_2() and OpenAIServingChat:
+    
+    if OpenAIServingChat:
         OpenAIServingChat._check_model = patch_check_model_v2
 
     if vllm_version_magic.less_than_0_2_7():
