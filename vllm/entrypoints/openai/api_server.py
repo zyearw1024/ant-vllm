@@ -244,6 +244,13 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
+@router.get("/check_nodes_status")
+async def pd_status() -> Response:
+    """check pd nodes ready status, only splitwise use"""
+    status_code, content = await async_engine_client.check_nodes_ready()
+    return Response(status_code=status_code, content=content)
+
+
 @router.post("/tokenize")
 async def tokenize(request: TokenizeRequest):
     generator = await openai_serving_tokenization.create_tokenize(request)

@@ -270,6 +270,10 @@ def _is_cpu() -> bool:
     return VLLM_TARGET_DEVICE == "cpu"
 
 
+def _is_ascend() -> bool:
+    return VLLM_TARGET_DEVICE == "npu"
+
+
 def _is_openvino() -> bool:
     return VLLM_TARGET_DEVICE == "openvino"
 
@@ -283,7 +287,7 @@ def _build_custom_ops() -> bool:
 
 
 def _build_core_ext() -> bool:
-    return not (_is_neuron() or _is_tpu() or _is_openvino() or _is_xpu())
+    return not (_is_neuron() or _is_tpu() or _is_openvino() or _is_xpu() or _is_ascend())
 
 
 def get_hipcc_rocm_version():
@@ -364,6 +368,8 @@ def get_vllm_version() -> str:
     if _no_device():
         if envs.VLLM_TARGET_DEVICE == "empty":
             version += "+empty"
+    elif _is_ascend():
+        version += '+npu'
     elif _is_cuda():
         cuda_version = str(get_nvcc_cuda_version())
         if cuda_version != MAIN_CUDA_VERSION:
@@ -420,6 +426,8 @@ def get_requirements() -> List[str]:
 
     if _no_device():
         requirements = _read_requirements("requirements-cuda.txt")
+    elif _is_ascend():
+        requirements = _read_requirements("requirements-common.txt")
     elif _is_cuda():
         requirements = _read_requirements("requirements-cuda.txt")
         cuda_major, cuda_minor = torch.version.cuda.split(".")

@@ -34,7 +34,15 @@ engine = None
 @app.get("/health")
 async def health() -> Response:
     """Health check."""
+    await engine.check_health()
     return Response(status_code=200)
+
+
+@app.get("/check_nodes_status")
+async def pd_status() -> Response:
+    """check pd nodes ready status, only splitwise use"""
+    status_code, content = await engine.check_nodes_ready()
+    return Response(status_code=status_code, content=content)
 
 
 @app.post("/generate")
