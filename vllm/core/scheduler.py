@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import enum
 import os
 import random
@@ -166,9 +168,18 @@ class SchedulerOutputs:
                 and not self.blocks_to_swap_out and not self.blocks_to_copy)
 
     def _sort_by_lora_ids(self):
-        self.scheduled_seq_groups = sorted(
-            self.scheduled_seq_groups,
-            key=lambda g: (g.seq_group.lora_int_id, g.seq_group.request_id))
+        assert 0 <= self.num_prefill_groups <= len(self.scheduled_seq_groups)
+
+        def key_fn(group: ScheduledSequenceGroup):
+            key = (group.seq_group.lora_int_id, group.seq_group.request_id)
+            if 0 < self.num_prefill_groups < len(self.scheduled_seq_groups):
+                # Sort sequence groups so that all prefills come before all
+                # decodes as required by chunked prefill.
+                return (not group.seq_group.is_prefill(), *key)
+            return key
+
+        self.scheduled_seq_groups = sorted(self.scheduled_seq_groups,
+                                           key=key_fn)
 
     @property
     def lora_requests(self) -> Set[LoRARequest]:
@@ -328,7 +339,7 @@ class Scheduler:
         self.lora_config = lora_config
 
         version = "selfattn"
-        if (self.scheduler_config.task == "embedding"
+        if (self.scheduler_config.runner_type == "pooling"
                 or self.cache_config.is_attention_free):
             version = "placeholder"
 
@@ -494,6 +505,9 @@ class Scheduler:
 
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         return self.block_manager.get_prefix_cache_hit_rate(device)
+
+    def reset_prefix_cache(self) -> bool:
+        return self.block_manager.reset_prefix_cache()
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
@@ -976,8 +990,8 @@ class Scheduler:
                     waiting_queue.popleft()
                     continue
 
-            if (budget.num_batched_tokens >=
-                    self.scheduler_config.max_num_batched_tokens):
+            if (budget.num_batched_tokens
+                    >= self.scheduler_config.max_num_batched_tokens):
                 # We've reached the budget limit - since there might be
                 # continuous prefills in the running queue, we should break
                 # to avoid scheduling any new prefills.
@@ -1084,8 +1098,8 @@ class Scheduler:
                     running_scheduled.swapped_out) == 0:
                 swapped_in = self._schedule_swapped(budget, curr_loras)
 
-        assert (budget.num_batched_tokens <=
-                self.scheduler_config.max_num_batched_tokens)
+        assert (budget.num_batched_tokens
+                <= self.scheduler_config.max_num_batched_tokens)
         assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
 
         # Update waiting requests.
@@ -1177,8 +1191,8 @@ class Scheduler:
                                            curr_loras,
                                            enable_chunking=True)
 
-        assert (budget.num_batched_tokens <=
-                self.scheduler_config.max_num_batched_tokens)
+        assert (budget.num_batched_tokens
+                <= self.scheduler_config.max_num_batched_tokens)
         assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
 
         # Update waiting requests.
@@ -1201,15 +1215,25 @@ class Scheduler:
         # Update swapped requests.
         self.swapped.extend(running_scheduled.swapped_out)
         # Put prefills first due to Attention backend ordering assumption.
+        scheduled_seq_groups = (prefills.seq_groups +
+                                running_scheduled.prefill_seq_groups +
+                                swapped_in.prefill_seq_groups +
+                                running_scheduled.decode_seq_groups +
+                                swapped_in.decode_seq_groups)
+        num_prefill_groups = (len(prefills.seq_groups) +
+                              len(swapped_in.prefill_seq_groups) +
+                              len(running_scheduled.prefill_seq_groups))
+        # If all prompts, then we set num_lookahead_slots to 0
+        # this allows us to go through the `no_spec` path in
+        # `spec_decode_worker.py`
+        all_prefills = (len(scheduled_seq_groups) == num_prefill_groups)
+        num_lookahead_slots = (0 if
+                               (all_prefills
+                                and not self.scheduler_config.is_multi_step)
+                               else running_scheduled.num_lookahead_slots)
         return SchedulerOutputs(
-            scheduled_seq_groups=(prefills.seq_groups +
-                                  running_scheduled.prefill_seq_groups +
-                                  swapped_in.prefill_seq_groups +
-                                  running_scheduled.decode_seq_groups +
-                                  swapped_in.decode_seq_groups),
-            num_prefill_groups=(len(prefills.seq_groups) +
-                                len(swapped_in.prefill_seq_groups) +
-                                len(running_scheduled.prefill_seq_groups)),
+            scheduled_seq_groups=scheduled_seq_groups,
+            num_prefill_groups=num_prefill_groups,
             num_batched_tokens=budget.num_batched_tokens +
             budget.num_cached_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
@@ -1218,7 +1242,7 @@ class Scheduler:
             swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
             swapped_in.infeasible_seq_groups,
-            num_lookahead_slots=running_scheduled.num_lookahead_slots,
+            num_lookahead_slots=num_lookahead_slots,
             running_queue_size=len(self.running),
             preempted=(len(running_scheduled.preempted) +
                        len(running_scheduled.swapped_out)),
@@ -1336,8 +1360,8 @@ class Scheduler:
                 # NOTE: We use get_len instead of get_prompt_len because when
                 # a sequence is preempted, prefill includes previous generated
                 # output tokens.
-                if (token_chunk_size + num_computed_tokens <
-                        seqs[0].data.get_len()):
+                if (token_chunk_size + num_computed_tokens
+                        < seqs[0].data.get_len()):
                     do_sample = False
 
             # It assumes the scheduled_seq_groups is ordered by
@@ -1357,6 +1381,7 @@ class Scheduler:
                     encoder_seq_data=encoder_seq_data,
                     cross_block_table=cross_block_table,
                     state=seq_group.state,
+                    token_type_ids=seq_group.token_type_ids,
                     # `multi_modal_data` will only be present for the 1st comm
                     # between engine and worker.
                     # the subsequent comms can still use delta, but
@@ -1559,6 +1584,7 @@ class Scheduler:
             seq.status = SequenceStatus.WAITING
             self.free_seq(seq)
             seq.reset_state_for_recompute()
+        self._free_seq_group_cross_attn_blocks(seq_group)
 
     def _preempt_by_swap(
         self,
@@ -1601,10 +1627,9 @@ class Scheduler:
         if self.scheduler_config.delay_factor > 0 and self.waiting:
             earliest_arrival_time = min(
                 [e.metrics.arrival_time for e in self.waiting])
-            passed_delay = (
-                (now - earliest_arrival_time) >
-                (self.scheduler_config.delay_factor * self.last_prompt_latency)
-                or not self.running)
+            passed_delay = ((now - earliest_arrival_time)
+                            > (self.scheduler_config.delay_factor *
+                               self.last_prompt_latency) or not self.running)
         else:
             passed_delay = True
         return passed_delay
