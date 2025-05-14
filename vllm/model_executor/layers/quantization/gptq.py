@@ -3,13 +3,14 @@
 import enum
 from enum import Enum
 from fractions import Fraction
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.linear import LinearMethodBase
+from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
@@ -33,11 +34,11 @@ class GPTQConfig(QuantizationConfig):
         group_size: int,
         desc_act: bool,
         lm_head_quantized: bool,
-        dynamic: Dict[str, Dict[str, Union[int, bool]]],
+        dynamic: dict[str, dict[str, Union[int, bool]]],
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
-        # Format is Dict[str, Dict] where key is a regex string that can
+        # Format is dict[str, dict] where key is a regex string that can
         # perform both positive ("+:" prefixed) or negative ("-:" prefixed)
         # matching of a module.
         # Default to positive match, override base quant config mode, if no
@@ -58,6 +59,7 @@ class GPTQConfig(QuantizationConfig):
         #  r"+:.*\.(?:1[6-9]|20|21)\..*": {"bits": 8, "group_size": 64,},
         #  r"-:.*\.moe\..*": {}, # negative match (skip) all `moe` layers
         # }
+        super().__init__()
         self.dynamic = dynamic
 
         self.weight_bits = weight_bits
@@ -73,16 +75,16 @@ class GPTQConfig(QuantizationConfig):
     def __repr__(self) -> str:
         return (f"GPTQConfig(weight_bits={self.weight_bits}, "
                 f"group_size={self.group_size}, "
-                f"desc_act={self.desc_act}),"
+                f"desc_act={self.desc_act}), "
                 f"lm_head_quantized={self.lm_head_quantized}), "
                 f"dynamic={self.dynamic}")
 
     @classmethod
-    def get_name(cls) -> str:
+    def get_name(cls) -> QuantizationMethods:
         return "gptq"
 
     @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.half]
 
     @classmethod
@@ -91,11 +93,11 @@ class GPTQConfig(QuantizationConfig):
         return 60
 
     @classmethod
-    def get_config_filenames(cls) -> List[str]:
+    def get_config_filenames(cls) -> list[str]:
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQConfig":
+    def from_config(cls, config: dict[str, Any]) -> "GPTQConfig":
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -133,7 +135,7 @@ class GPTQLinearMethod(LinearMethodBase):
         self,
         layer: torch.nn.Module,
         input_size_per_partition: int,
-        output_partition_sizes: List[int],
+        output_partition_sizes: list[int],
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
