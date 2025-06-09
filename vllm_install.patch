@@ -1,0 +1,170 @@
+diff --git a/setup.py b/setup.py
+index a4043c4..26027dd 100755
+--- a/setup.py
++++ b/setup.py
+@@ -389,6 +389,9 @@ def _is_openvino() -> bool:
+     return VLLM_TARGET_DEVICE == "openvino"
+
+
++def _is_ascend() -> bool:
++    return VLLM_TARGET_DEVICE == "npu"
++
+ def _is_xpu() -> bool:
+     return VLLM_TARGET_DEVICE == "xpu"
+
+@@ -488,6 +491,8 @@ def get_vllm_version() -> str:
+     if _no_device():
+         if envs.VLLM_TARGET_DEVICE == "empty":
+             version += f"{sep}empty"
++    elif _is_ascend():
++        version += f"{sep}npu"
+     elif _is_cuda():
+         if envs.VLLM_USE_PRECOMPILED:
+             version += f"{sep}precompiled"
+@@ -557,6 +562,8 @@ def get_requirements() -> List[str]:
+
+     if _no_device():
+         requirements = _read_requirements("requirements-common.txt")
++    elif _is_ascend():
++        requirements = _read_requirements("requirements-common.txt")
+     elif _is_cuda():
+         requirements = _read_requirements("requirements-cuda.txt")
+         cuda_major, cuda_minor = torch.version.cuda.split(".")
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 0210590..707df8b 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -19,7 +19,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer, BatchEncoding,
+                           BatchFeature)
+ from transformers.models.auto.auto_factory import _BaseAutoModelClass
+
+-from tests.models.utils import (TokensTextLogprobs,
++from vllm_tests.models.utils import (TokensTextLogprobs,
+                                 TokensTextLogprobsPromptLogprobs)
+ from vllm import LLM, SamplingParams
+ from vllm.assets.image import ImageAsset
+diff --git a/vllm/__init__.py b/vllm/__init__.py
+index 566c511..90b1d63 100644
+--- a/vllm/__init__.py
++++ b/vllm/__init__.py
+@@ -4,6 +4,7 @@ import os
+
+ import torch
+
++import vllm_npu
+ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+ from vllm.engine.async_llm_engine import AsyncLLMEngine
+ from vllm.engine.llm_engine import LLMEngine
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index d82d9ad..3f6c405 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -1441,6 +1441,12 @@ class LLMEngine:
+                 self.do_tracing(scheduler_outputs)
+         else:
+             # Multi-step case
++            stop_multi_step = self.check_stop_multi_step(scheduler_outputs)
++            if stop_multi_step:
++                self.cached_scheduler_outputs[0] = SchedulerOutputState()
++                if len(ctx.output_queue) > 0:
++                    self._process_model_outputs(ctx=ctx)
++
+             return ctx.request_outputs
+
+         if not self.has_unfinished_requests():
+@@ -1459,6 +1465,13 @@ class LLMEngine:
+
+         return ctx.request_outputs
+
++    @staticmethod
++    def check_stop_multi_step(scheduler_outputs):
++        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
++            if not scheduled_seq_group.seq_group.is_finished():
++                return False
++        return True
++
+     def _has_remaining_steps(
+         self, seq_group_metadata_list: Optional[List[SequenceGroupMetadata]]
+     ) -> bool:
+diff --git a/vllm/entrypoints/api_server.py b/vllm/entrypoints/api_server.py
+index 9681850..fc7b3cc 100644
+--- a/vllm/entrypoints/api_server.py
++++ b/vllm/entrypoints/api_server.py
+@@ -35,8 +35,15 @@ engine = None
+ @app.get("/health")
+ async def health() -> Response:
+     """Health check."""
++    await engine.check_health()
+     return Response(status_code=200)
+
++@app.get("/check_nodes_status")
++async def pd_status() -> Response:
++    """check pd nodes ready status, only splitwise use"""
++    status_code, content = await engine.check_nodes_ready()
++    return Response(status_code=status_code, content=content)
++
+
+ @app.post("/generate")
+ async def generate(request: Request) -> Response:
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index b8f54d6..48cf3ce 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -329,6 +329,11 @@ async def health(raw_request: Request) -> Response:
+     await engine_client(raw_request).check_health()
+     return Response(status_code=200)
+
++@router.get("/check_nodes_status")
++async def pd_status(raw_request: Request) -> Response:
++    """check pd nodes ready status, only splitwise use"""
++    status_code, content = await engine_client(raw_request).check_nodes_ready()
++    return Response(status_code=status_code, content=content)
+
+ @router.api_route("/ping", methods=["GET", "POST"])
+ async def ping(raw_request: Request) -> Response:
+diff --git a/vllm/spec_decode/batch_expansion.py b/vllm/spec_decode/batch_expansion.py
+index e08ed74..4eaa699 100644
+--- a/vllm/spec_decode/batch_expansion.py
++++ b/vllm/spec_decode/batch_expansion.py
+@@ -6,7 +6,7 @@ from typing import Iterator, List, Optional, Tuple
+
+ import torch
+
+-from vllm import SamplingParams
++from vllm.sampling_params import SamplingParams
+ from vllm.model_executor.layers.sampler import SamplerOutput
+ from vllm.sequence import (VLLM_INVALID_TOKEN_ID, VLLM_TOKEN_ID_ARRAY_TYPE,
+                            ExecuteModelRequest, SequenceData,
+diff --git a/vllm/spec_decode/draft_model_runner.py b/vllm/spec_decode/draft_model_runner.py
+index 3948298..f3372d4 100644
+--- a/vllm/spec_decode/draft_model_runner.py
++++ b/vllm/spec_decode/draft_model_runner.py
+@@ -12,8 +12,7 @@ try:
+         from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+     except (ModuleNotFoundError, ImportError):
+         # vllm_flash_attn is not installed, try the ROCm FA metadata
+-        from vllm.attention.backends.rocm_flash_attn import (
+-            ROCmFlashAttentionMetadata as FlashAttentionMetadata)
++        pass
+ except (ModuleNotFoundError, ImportError) as err:
+     raise RuntimeError(
+         "Draft model speculative decoding currently only supports"
+diff --git a/vllm/worker/model_runner.py b/vllm/worker/model_runner.py
+index 12baecd..7ddd14f 100644
+--- a/vllm/worker/model_runner.py
++++ b/vllm/worker/model_runner.py
+@@ -71,8 +71,12 @@ _NUM_WARMUP_ITERS = 2
+ TModelInputForGPU = TypeVar('TModelInputForGPU', bound="ModelInputForGPU")
+
+ # For now, bump up cache limits for recompilations during CUDA graph warmups.
+-torch._dynamo.config.cache_size_limit = 128
+-torch._dynamo.config.accumulated_cache_size_limit = 128
++try:
++    # For now, bump up cache limits for recompilations during CUDA graph warmups.
++    torch._dynamo.config.cache_size_limit = 128
++    torch._dynamo.config.accumulated_cache_size_limit = 128
++except AttributeError:
++    pass
+
+
+ @dataclass(frozen=True)
