@@ -170,13 +170,6 @@ def _handle_qwen3_chat_template_thinking(request: Any) -> None:
             # Check if model name ends with '-think' (enable thinking)
             _enable_think = model_name.endswith("-think")
 
-            if _enable_think:
-                # Remove '-think' suffix from model name for actual model lookup
-                request.model = model_name.rstrip("-think")
-                logger.debug(
-                    f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled via -think suffix)"
-                )
-
         # Check if request has chat_template_kwargs attribute
         if not hasattr(request, "chat_template_kwargs"):
             # Create chat_template_kwargs as a dictionary if it doesn't exist
@@ -185,13 +178,6 @@ def _handle_qwen3_chat_template_thinking(request: Any) -> None:
         # Handle case where chat_template_kwargs is None
         if request.chat_template_kwargs is None:
             request.chat_template_kwargs = {}
-
-        # Handle case where chat_template_kwargs is a SimpleNamespace (convert to dict)
-        if hasattr(request.chat_template_kwargs, "__dict__") and not isinstance(
-            request.chat_template_kwargs, dict
-        ):
-            # Convert SimpleNamespace to dict
-            request.chat_template_kwargs = vars(request.chat_template_kwargs)
 
         # Ensure it's a dictionary
         if not isinstance(request.chat_template_kwargs, dict):
@@ -339,13 +325,6 @@ def _handle_qwen3_prompt_suffix_thinking(
         # Check if model name ends with '-think' (enable thinking)
         _enable_think = model_name.endswith("-think")
 
-        if _enable_think:
-            # Remove '-think' suffix from model name for actual model lookup
-            request.model = model_name.rstrip("-think")
-            logger.debug(
-                f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled)"
-            )
-
         # Check if content already has thinking tags to avoid duplication
         if THINKING_TAG_REGEX.search(content):
             logger.debug(
@@ -400,6 +379,42 @@ async def patch_check_model_v2(self: Any, request: Any) -> Optional[JSONResponse
     reset_default_request(request=request)
     ret = await self.origin_check_model(request)
     return ret
+
+
+def patch_is_model_supported(self: Any, model_name: Optional[str]) -> bool:
+    """
+    Patched _is_model_supported method that supports -think suffix for Qwen3 thinking mode.
+    Only processes -think suffix when Qwen3 thinking modes are enabled.
+
+    Args:
+        self: The serving instance
+        model_name: The model name to check
+
+    Returns:
+        bool: True if model is supported (including -think suffix variants when enabled)
+    """
+    if not model_name:
+        return True
+
+    # Check if the model name is directly supported
+    if self.origin_is_model_supported(model_name):
+        return True
+
+    # Check if Qwen3 thinking modes are enabled
+    qwen3_chat_template_thinking = get_qwen3_chat_template_thinking_status()
+    qwen3_prompt_suffix_thinking = get_qwen3_prompt_suffix_thinking_status()
+
+    # Only process -think suffix if at least one Qwen3 thinking mode is enabled
+    if (
+        qwen3_chat_template_thinking or qwen3_prompt_suffix_thinking
+    ) and model_name.endswith("-think"):
+        base_model_name = model_name.rstrip("-think")
+        logger.info(
+            f"Qwen3 thinking mode: Checking -think suffix model '{model_name}' -> base model '{base_model_name}'"
+        )
+        return self.origin_is_model_supported(base_model_name)
+
+    return False
 
 
 async def origin_serving_self_check_model(
@@ -681,6 +696,14 @@ def patch_api_server() -> None:
     if vllm_version_magic.less_than_0_2_7():
         OpenAIServing.origin_serving_check_model = OpenAIServing._check_model
         OpenAIServing._check_model = patch_serving_self_check_model
+
+    # Patch _is_model_supported method to support -think suffix for Qwen3 thinking mode
+    if OpenAIServing:
+        OpenAIServing.origin_is_model_supported = OpenAIServing._is_model_supported
+        OpenAIServing._is_model_supported = patch_is_model_supported
+        logger.info(
+            "Patched OpenAIServing._is_model_supported to support -think suffix"
+        )
 
     if FlexibleArgumentParser:
         FlexibleArgumentParser._origin_parse_args = FlexibleArgumentParser.parse_args
