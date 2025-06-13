@@ -3,8 +3,9 @@ import json
 import base64
 import logging
 import re
+import threading
+from typing import Optional, Union, List, Any
 
-from typing import Optional
 from vllm import __version__ as vllm_version
 from packaging import version
 from fastapi.responses import JSONResponse
@@ -13,7 +14,6 @@ from http import HTTPStatus
 from vllm.entrypoints.openai.protocol import StreamOptions
 from vllm.entrypoints.openai import cli_args
 from vllm.entrypoints.openai.cli_context_args import cliContext
-from typing import Union, List
 
 # Try importing VLLM components with version-specific handling
 try:
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # Compile the regex for checking /think or /nothink at the end of the string
-THINKING_TAG_REGEX = re.compile(r"/(think|nothink||no_think)\s*$")
+THINKING_TAG_REGEX = re.compile(r"/(think|nothink|no_think)\s*$")
 
 
 class VllmVersionMagic:
@@ -107,6 +107,9 @@ vllm_version_magic = VllmVersionMagic(vllm_version)
 # Store original make_arg_parser for later use
 origin_make_arg_parser = cli_args.make_arg_parser
 
+# Thread lock for cache invalidation safety
+_cache_lock = threading.RLock()
+
 
 @cache
 def get_default_model_template() -> Optional[str]:
@@ -155,41 +158,85 @@ def get_qwen3_chat_template_thinking_status() -> bool:
     return getattr(args, "qwen3_enable_chat_template_thinking", False)
 
 
-@cache
-def get_qwen3_chat_template_thinking_status() -> bool:
-    """Get qwen3_enable_chat_template_thinking status from CLI arguments"""
-    args = cliContext.args
-    if not args:
-        return False
-    return getattr(args, "qwen3_enable_chat_template_thinking", False)
 
 
-def _handle_qwen3_chat_template_thinking(request) -> None:
+def _handle_qwen3_chat_template_thinking(request: Any) -> None:
     """Handle Qwen3 chat template thinking logic (hard switch)."""
-    if not hasattr(request, "chat_template_kwargs"):
-        return
-    
-    if not hasattr(request.chat_template_kwargs, "enable_thinking"):
-        request.chat_template_kwargs.enable_thinking = True
-        logger.debug("Applied Qwen3 chat template thinking (hard switch)")
+    try:
+        # Initialize enable_thinking flag
+        _enable_think = False
+        
+        # Handle model name compatibility: support -think suffix like soft switch
+        if hasattr(request, "model") and request.model:
+            model_name = request.model
+            # Check if model name ends with '-think' (enable thinking)
+            _enable_think = model_name.endswith("-think")
+            
+            if _enable_think:
+                # Remove '-think' suffix from model name for actual model lookup
+                request.model = model_name.rstrip("-think")
+                logger.debug(f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled via -think suffix)")
+        
+        # Check if request has chat_template_kwargs attribute
+        if not hasattr(request, "chat_template_kwargs"):
+            # Create chat_template_kwargs as a dictionary if it doesn't exist
+            request.chat_template_kwargs = {}
+        
+        # Handle case where chat_template_kwargs is None
+        if request.chat_template_kwargs is None:
+            request.chat_template_kwargs = {}
+        
+        # Handle case where chat_template_kwargs is a SimpleNamespace (convert to dict)
+        if hasattr(request.chat_template_kwargs, '__dict__') and not isinstance(request.chat_template_kwargs, dict):
+            # Convert SimpleNamespace to dict
+            request.chat_template_kwargs = vars(request.chat_template_kwargs)
+        
+        # Ensure it's a dictionary
+        if not isinstance(request.chat_template_kwargs, dict):
+            request.chat_template_kwargs = {}
+        
+        # Check if enable_thinking is already set
+        if "enable_thinking" not in request.chat_template_kwargs:
+            # Set enable_thinking based on model name suffix
+            # Only enable thinking if model name ends with '-think'
+            request.chat_template_kwargs["enable_thinking"] = _enable_think
+            logger.debug(f"Applied Qwen3 chat template thinking (hard switch): enable_thinking={_enable_think}")
+        else:
+            logger.debug(f"Qwen3 chat template thinking already set: {request.chat_template_kwargs['enable_thinking']}")
+            
+    except Exception as e:
+        logger.debug(f"Error processing qwen3 chat template thinking: {e}")
 
 
-def handle_qwen3_thinking_modes(request) -> None:
+def handle_qwen3_thinking_modes(request: Any) -> None:
     """
     Handle all Qwen3 thinking mode logic (both hard and soft switches).
     Enforces mutual exclusion between different thinking modes.
-    """
-    qwen3_chat_template_thinking = get_qwen3_chat_template_thinking_status()
-    qwen3_prompt_suffix_thinking = get_qwen3_prompt_suffix_thinking_status()
+    Default behavior: no thinking mode enabled unless explicitly requested.
     
-    if qwen3_chat_template_thinking and qwen3_prompt_suffix_thinking:
-        logger.warning("Both Qwen3 thinking modes enabled, using hard switch only")
-        qwen3_prompt_suffix_thinking = False
+    Args:
+        request: The request object to modify
+    """
+    try:
+        qwen3_chat_template_thinking = get_qwen3_chat_template_thinking_status()
+        qwen3_prompt_suffix_thinking = get_qwen3_prompt_suffix_thinking_status()
+        
+        # Mutual exclusion: hard switch takes priority over soft switch
+        if qwen3_chat_template_thinking and qwen3_prompt_suffix_thinking:
+            logger.debug("Both Qwen3 thinking modes enabled, using hard switch only")
+            qwen3_prompt_suffix_thinking = False
 
-    if qwen3_chat_template_thinking:
-        _handle_qwen3_chat_template_thinking(request)
-    elif qwen3_prompt_suffix_thinking:
-        _handle_qwen3_prompt_suffix_thinking(request, qwen3_prompt_suffix_thinking)
+        # Process thinking modes in order of priority
+        if qwen3_chat_template_thinking:
+            _handle_qwen3_chat_template_thinking(request)
+        elif qwen3_prompt_suffix_thinking:
+            _handle_qwen3_prompt_suffix_thinking(request, qwen3_prompt_suffix_thinking)
+        else:
+            # Default behavior: no thinking mode enabled
+            logger.debug("No Qwen3 thinking modes enabled, using default behavior")
+            
+    except Exception as e:
+        logger.debug(f"Error handling qwen3 thinking modes: {e}")
 
 
 @cache
@@ -208,7 +255,8 @@ def get_default_stop() -> Optional[Union[str, List[str]]]:
         try:
             decoded = base64.b64decode(args.default_stop_base64).decode("utf-8")
             return parse_stop_string(decoded)
-        except:
+        except (ValueError, TypeError, UnicodeDecodeError) as e:
+            logger.debug(f"Failed to decode base64 stop string: {e}")
             pass
 
     # Try plain stop
@@ -231,50 +279,83 @@ def get_default_stop_token_ids() -> Optional[list]:
     if stop_token_ids:
         try:
             return [int(x.strip()) for x in stop_token_ids.split(",")]
-        except:
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Failed to parse stop token ids: {e}")
             pass
     return None
 
 
-def _handle_qwen3_prompt_suffix_thinking(request, qwen3_enable_prompt_suffix_thinking):
-    """Handle Qwen3 thinking logic based on model name and enable flag."""
+def _handle_qwen3_prompt_suffix_thinking(request: Any, qwen3_enable_prompt_suffix_thinking: bool) -> None:
+    """
+    Handle Qwen3 thinking logic based on model name and enable flag (soft switch).
+    Default behavior: no thinking mode unless model name ends with '-think'.
+    
+    Args:
+        request: The request object to modify
+        qwen3_enable_prompt_suffix_thinking: Whether prompt suffix thinking is enabled
+    """
     try:
-        # If qwen3 prompt suffix thinking is not enabled, return
+        # If qwen3 prompt suffix thinking is not enabled, return early
         if not qwen3_enable_prompt_suffix_thinking:
+            logger.debug("Qwen3 prompt suffix thinking disabled, skipping")
             return
 
-        # Ensure messages exist and is a list
+        # Ensure request has required attributes
         if not hasattr(request, "messages") or not request.messages or not isinstance(request.messages, list):
+            logger.debug("Request missing valid messages, skipping qwen3 prompt suffix thinking")
+            return
+
+        # Ensure request has model attribute
+        if not hasattr(request, "model") or not request.model:
+            logger.debug("Request missing model name, skipping qwen3 prompt suffix thinking")
             return
 
         last_message = request.messages[-1]
 
-        # Ensure the last message is a dictionary and has content
+        # Ensure the last message is valid
         if not isinstance(last_message, dict) or "content" not in last_message:
+            logger.debug("Last message invalid, skipping qwen3 prompt suffix thinking")
             return
 
         content = last_message["content"]
         model_name = request.model
-        _enable_think = True if model_name.endswith("-think") else False
+        
+        # Check if model name ends with '-think' (enable thinking)
+        _enable_think = model_name.endswith("-think")
+        
         if _enable_think:
-            #   # Patch SubCliServe
+            # Remove '-think' suffix from model name for actual model lookup
             request.model = model_name.rstrip("-think")
-        # Check if content already ends with /think or /nothink followed by optional whitespace
+            logger.debug(f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled)")
+        
+        # Check if content already has thinking tags to avoid duplication
         if THINKING_TAG_REGEX.search(content):
+            logger.debug("Content already contains thinking tags, skipping modification")
             return
 
-        # Determine the tag to add based on model name
+        # Add appropriate thinking tag based on model name
         if _enable_think:
             last_message["content"] += " /think"
+            logger.debug("Added '/think' suffix to prompt (thinking enabled)")
         else:
+            # Default behavior: explicitly disable thinking for non-think models
             last_message["content"] += " /no_think"
+            logger.debug("Added '/no_think' suffix to prompt (thinking disabled by default)")
 
     except Exception as e:
-        logger.error(f"Error processing qwen3 prompt suffix thinking: {e}")
+        logger.debug(f"Error processing qwen3 prompt suffix thinking: {e}")
 
 
-async def patch_check_model(request) -> Optional[JSONResponse]:
-    """Patch for check_model in versions < 0.6.2"""
+async def patch_check_model(request: Any) -> Optional[JSONResponse]:
+    """
+    Patch for check_model in versions < 0.6.2
+    
+    Args:
+        request: The request object to check and modify
+        
+    Returns:
+        Optional JSONResponse if model check fails
+    """
     if version.parse(vllm_version) < version.parse("0.6.2"):
         from vllm.entrypoints.openai.api_server import origin_check_model
 
@@ -283,15 +364,33 @@ async def patch_check_model(request) -> Optional[JSONResponse]:
     return ret
 
 
-async def patch_check_model_v2(self, request):
-    """Patch for check_model in versions >= 0.6.2"""
+async def patch_check_model_v2(self: Any, request: Any) -> Optional[JSONResponse]:
+    """
+    Patch for check_model in versions >= 0.6.2
+    
+    Args:
+        self: The serving instance
+        request: The request object to check and modify
+        
+    Returns:
+        Optional JSONResponse if model check fails
+    """
     reset_default_request(request=request)
     ret = await self.origin_check_model(request)
     return ret
 
 
-async def origin_serving_self_check_model(self, request):
-    """Original serving model check implementation"""
+async def origin_serving_self_check_model(self: Any, request: Any) -> Optional[JSONResponse]:
+    """
+    Original serving model check implementation
+    
+    Args:
+        self: The serving instance
+        request: The request object to check
+        
+    Returns:
+        Optional JSONResponse if model check fails
+    """
     if request.model in self.served_model_names:
         return None
     if request.model in [lora.lora_name for lora in self.lora_requests]:
@@ -308,8 +407,17 @@ async def origin_serving_self_check_model(self, request):
     )
 
 
-async def patch_serving_self_check_model(self, request):
-    """Patch for serving model check"""
+async def patch_serving_self_check_model(self: Any, request: Any) -> Optional[JSONResponse]:
+    """
+    Patch for serving model check
+    
+    Args:
+        self: The serving instance
+        request: The request object to check and modify
+        
+    Returns:
+        Optional JSONResponse if model check fails
+    """
     reset_default_request(request=request)
     ret = await self.origin_serving_check_model(request)
     return ret
@@ -333,12 +441,21 @@ def parse_stop_string(stop_str: str) -> Union[str, List[str]]:
         elif isinstance(parsed, str):
             return parsed
         return stop_str
-    except:
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.debug(f"Failed to parse stop string as JSON: {e}")
         return stop_str
 
 
-def patch_make_arg_parser(*args):
-    """Add custom arguments to the argument parser"""
+def patch_make_arg_parser(*args: Any) -> Any:
+    """
+    Add custom arguments to the argument parser
+    
+    Args:
+        *args: Arguments passed to the original make_arg_parser
+        
+    Returns:
+        The modified argument parser
+    """
     logger.info("Patching make_arg_parser to add custom arguments")
     parser = origin_make_arg_parser(*args)
 
@@ -402,8 +519,18 @@ def patch_make_arg_parser(*args):
     return parser
 
 
-def _patch_parse_args(self, *args, **kwargs):
-    """Patch for argument parsing with context storage"""
+def _patch_parse_args(self: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    Patch for argument parsing with context storage
+    
+    Args:
+        self: The parser instance
+        *args: Arguments passed to parse_args
+        **kwargs: Keyword arguments passed to parse_args
+        
+    Returns:
+        Parsed arguments
+    """
     logger.info("Entering _patch_parse_args")
     # The problematic call that resets args is `parser.parse_args([])`.
     # In this case, the `args` tuple will be `([],)`.
@@ -414,10 +541,10 @@ def _patch_parse_args(self, *args, **kwargs):
 
     parsed_args = self._origin_parse_args(*args, **kwargs)
     logger.info(f"_patch_parse_args Parsed Arguments: {parsed_args}")
-    from vllm.entrypoints.openai.cli_context_args import cliContext
 
     if not is_default_check_parse:
-        cliContext.args = parsed_args
+        with _cache_lock:
+            cliContext.args = parsed_args
         logger.info(f"cliContext.args updated to: {cliContext.args}")
     else:
         logger.info("Skipping update of cliContext.args for default check parse.")
@@ -425,7 +552,25 @@ def _patch_parse_args(self, *args, **kwargs):
     return parsed_args
 
 
-def reset_default_request(request) -> None:
+def _apply_default_list_value(request: Any, attr_name: str, default_value: Union[str, List[str]]) -> None:
+    """
+    Apply default value to request attribute if not present or empty
+    
+    Args:
+        request: The request object to modify
+        attr_name: The attribute name to set
+        default_value: The default value to apply
+    """
+    if not hasattr(request, attr_name) or not getattr(request, attr_name):
+        setattr(request, attr_name, default_value if isinstance(default_value, list) else [default_value])
+    else:
+        current_values = getattr(request, attr_name)
+        current_list = current_values if isinstance(current_values, list) else [current_values]
+        new_list = default_value if isinstance(default_value, list) else [default_value]
+        setattr(request, attr_name, current_list + new_list)
+
+
+def reset_default_request(request: Any) -> None:
     """
     Reset request defaults and apply configuration settings
 
@@ -453,24 +598,13 @@ def reset_default_request(request) -> None:
 
     # Handle default stop
     default_stop = get_default_stop()
-    # logger.debug("default_stop: %s", default_stop)
+    logger.debug("default_stop: %s", default_stop)
     if default_stop:
-        if not hasattr(request, "stop") or not request.stop:
-            request.stop = (
-                default_stop if isinstance(default_stop, list) else [default_stop]
-            )
-        else:
-            current_stops = (
-                request.stop if isinstance(request.stop, list) else [request.stop]
-            )
-            new_stops = (
-                default_stop if isinstance(default_stop, list) else [default_stop]
-            )
-            request.stop = current_stops + new_stops
+        _apply_default_list_value(request, "stop", default_stop)
 
     # Handle default stop token ids
     default_stop_token_ids = get_default_stop_token_ids()
-    # logger.debug("default_stop_token_ids: %s", default_stop_token_ids)
+    logger.debug("default_stop_token_ids: %s", default_stop_token_ids)
     if default_stop_token_ids:
         if not hasattr(request, "stop_token_ids") or not request.stop_token_ids:
             request.stop_token_ids = default_stop_token_ids
@@ -479,8 +613,11 @@ def reset_default_request(request) -> None:
 
 
 def patch_api_server() -> None:
-    """Apply patches to VLLM API server components based on version"""
-
+    """
+    Apply patches to VLLM API server components based on version.
+    This function modifies various VLLM components to add custom functionality
+    including argument parsing, model checking, and request processing.
+    """
     logger.info("Loading monkey_patch_api_request_v4")
 
     try:
@@ -521,9 +658,9 @@ def patch_api_server() -> None:
             setattr(module, "make_arg_parser", patch_make_arg_parser)
 
 
-def examples():
-    """Example usage of version comparison"""
-    vllm_version = "0.6.4.dev653+g1b5b0be7.d20241125"
+def _examples() -> None:
+    """Example usage of version comparison - for testing purposes only"""
+    test_version = "0.6.4.dev653+g1b5b0be7.d20241125"
 
     if vllm_version_magic.less_than_0_6_2():
         logger.info("Using legacy import")
@@ -535,4 +672,4 @@ def examples():
 
 
 if __name__ == "__main__":
-    examples()
+    _examples()
