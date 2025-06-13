@@ -1,6 +1,7 @@
 import sys
 import json
 import base64
+import logging
 
 from typing import Optional
 from vllm import __version__ as vllm_version
@@ -22,6 +23,9 @@ except ImportError:
     OpenAIServing = None
     OpenAIServingChat = None
     FlexibleArgumentParser = None
+
+
+logger = logging.getLogger(__name__)
 
 
 class VllmVersionMagic:
@@ -106,7 +110,7 @@ def get_default_model_template() -> Optional[str]:
     if not args:
         return None
     default_model_template = getattr(args, "default_model_template", None)
-    print("default_model_template", default_model_template)
+    logger.debug("default_model_template: %s", default_model_template)
     return default_model_template
 
 
@@ -238,7 +242,7 @@ def parse_stop_string(stop_str: str) -> Union[str, List[str]]:
 
 def patch_make_arg_parser(*args):
     """Add custom arguments to the argument parser"""
-    print("patch_make_arg_parser")
+    logger.info("Patching make_arg_parser to add custom arguments")
     parser = origin_make_arg_parser(*args)
 
     parser.add_argument(
@@ -283,10 +287,25 @@ def patch_make_arg_parser(*args):
 
 def _patch_parse_args(self, *args, **kwargs):
     """Patch for argument parsing with context storage"""
-    args = self._origin_parse_args(*args, **kwargs)
-    print("_patch_parse_args Parsed Arguments:", args)
-    cliContext.args = args
-    return args
+    logger.info("Entering _patch_parse_args")
+    # The problematic call that resets args is `parser.parse_args([])`.
+    # In this case, the `args` tuple will be `([],)`.
+    # We want to avoid storing the result of this specific call.
+    # The main entrypoint calls `parse_args()` with no arguments,
+    # which means `args` will be an empty tuple `()`.
+    is_default_check_parse = args and isinstance(args[0], list) and not args[0]
+
+    parsed_args = self._origin_parse_args(*args, **kwargs)
+    logger.info(f"_patch_parse_args Parsed Arguments: {parsed_args}")
+    from vllm.entrypoints.openai.cli_context_args import cliContext
+
+    if not is_default_check_parse:
+        cliContext.args = parsed_args
+        logger.info(f"cliContext.args updated to: {cliContext.args}")
+    else:
+        logger.info("Skipping update of cliContext.args for default check parse.")
+
+    return parsed_args
 
 
 def reset_default_request(request) -> None:
@@ -314,7 +333,7 @@ def reset_default_request(request) -> None:
 
     # Handle default stop
     default_stop = get_default_stop()
-    # print("default_stop", default_stop)
+    # logger.debug("default_stop: %s", default_stop)
     if default_stop:
         if not hasattr(request, "stop") or not request.stop:
             request.stop = (
@@ -331,7 +350,7 @@ def reset_default_request(request) -> None:
 
     # Handle default stop token ids
     default_stop_token_ids = get_default_stop_token_ids()
-    # print("default_stop_token_ids", default_stop_token_ids)
+    # logger.debug("default_stop_token_ids: %s", default_stop_token_ids)
     if default_stop_token_ids:
         if not hasattr(request, "stop_token_ids") or not request.stop_token_ids:
             request.stop_token_ids = default_stop_token_ids
@@ -342,7 +361,7 @@ def reset_default_request(request) -> None:
 def patch_api_server() -> None:
     """Apply patches to VLLM API server components based on version"""
 
-    print("load monkey_patch_api_request_v4")
+    logger.info("Loading monkey_patch_api_request_v4")
 
     try:
         if vllm_version_magic.less_than_0_6_2():
@@ -377,7 +396,8 @@ def patch_api_server() -> None:
 
     cli_args.make_arg_parser = patch_make_arg_parser
     for name, module in sys.modules.items():
-        if name.startswith("vllm.entrypoints.openai.cli_args") and hasattr(module, "make_arg_parser"):
+        if name.startswith("vllm") and hasattr(module, "make_arg_parser"):
+        # if name.startswith("vllm.entrypoints.openai.cli_args") and hasattr(module, "make_arg_parser"):
             setattr(module, "make_arg_parser", patch_make_arg_parser)
 
 
@@ -386,12 +406,12 @@ def examples():
     vllm_version = "0.6.4.dev653+g1b5b0be7.d20241125"
 
     if vllm_version_magic.less_than_0_6_2():
-        print("Using legacy import")
+        logger.info("Using legacy import")
     else:
-        print("Using new import")
+        logger.info("Using new import")
 
     if vllm_version_magic.less_than("0.7.0"):
-        print("Version is less than 0.7.0")
+        logger.info("Version is less than 0.7.0")
 
 
 if __name__ == "__main__":
