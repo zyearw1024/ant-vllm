@@ -158,52 +158,58 @@ def get_qwen3_chat_template_thinking_status() -> bool:
     return getattr(args, "qwen3_enable_chat_template_thinking", False)
 
 
-
-
 def _handle_qwen3_chat_template_thinking(request: Any) -> None:
     """Handle Qwen3 chat template thinking logic (hard switch)."""
     try:
         # Initialize enable_thinking flag
         _enable_think = False
-        
+
         # Handle model name compatibility: support -think suffix like soft switch
         if hasattr(request, "model") and request.model:
             model_name = request.model
             # Check if model name ends with '-think' (enable thinking)
             _enable_think = model_name.endswith("-think")
-            
+
             if _enable_think:
                 # Remove '-think' suffix from model name for actual model lookup
                 request.model = model_name.rstrip("-think")
-                logger.debug(f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled via -think suffix)")
-        
+                logger.debug(
+                    f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled via -think suffix)"
+                )
+
         # Check if request has chat_template_kwargs attribute
         if not hasattr(request, "chat_template_kwargs"):
             # Create chat_template_kwargs as a dictionary if it doesn't exist
             request.chat_template_kwargs = {}
-        
+
         # Handle case where chat_template_kwargs is None
         if request.chat_template_kwargs is None:
             request.chat_template_kwargs = {}
-        
+
         # Handle case where chat_template_kwargs is a SimpleNamespace (convert to dict)
-        if hasattr(request.chat_template_kwargs, '__dict__') and not isinstance(request.chat_template_kwargs, dict):
+        if hasattr(request.chat_template_kwargs, "__dict__") and not isinstance(
+            request.chat_template_kwargs, dict
+        ):
             # Convert SimpleNamespace to dict
             request.chat_template_kwargs = vars(request.chat_template_kwargs)
-        
+
         # Ensure it's a dictionary
         if not isinstance(request.chat_template_kwargs, dict):
             request.chat_template_kwargs = {}
-        
+
         # Check if enable_thinking is already set
         if "enable_thinking" not in request.chat_template_kwargs:
             # Set enable_thinking based on model name suffix
             # Only enable thinking if model name ends with '-think'
             request.chat_template_kwargs["enable_thinking"] = _enable_think
-            logger.debug(f"Applied Qwen3 chat template thinking (hard switch): enable_thinking={_enable_think}")
+            logger.debug(
+                f"Applied Qwen3 chat template thinking (hard switch): enable_thinking={_enable_think}"
+            )
         else:
-            logger.debug(f"Qwen3 chat template thinking already set: {request.chat_template_kwargs['enable_thinking']}")
-            
+            logger.debug(
+                f"Qwen3 chat template thinking already set: {request.chat_template_kwargs['enable_thinking']}"
+            )
+
     except Exception as e:
         logger.debug(f"Error processing qwen3 chat template thinking: {e}")
 
@@ -213,14 +219,14 @@ def handle_qwen3_thinking_modes(request: Any) -> None:
     Handle all Qwen3 thinking mode logic (both hard and soft switches).
     Enforces mutual exclusion between different thinking modes.
     Default behavior: no thinking mode enabled unless explicitly requested.
-    
+
     Args:
         request: The request object to modify
     """
     try:
         qwen3_chat_template_thinking = get_qwen3_chat_template_thinking_status()
         qwen3_prompt_suffix_thinking = get_qwen3_prompt_suffix_thinking_status()
-        
+
         # Mutual exclusion: hard switch takes priority over soft switch
         if qwen3_chat_template_thinking and qwen3_prompt_suffix_thinking:
             logger.debug("Both Qwen3 thinking modes enabled, using hard switch only")
@@ -234,7 +240,7 @@ def handle_qwen3_thinking_modes(request: Any) -> None:
         else:
             # Default behavior: no thinking mode enabled
             logger.debug("No Qwen3 thinking modes enabled, using default behavior")
-            
+
     except Exception as e:
         logger.debug(f"Error handling qwen3 thinking modes: {e}")
 
@@ -285,11 +291,13 @@ def get_default_stop_token_ids() -> Optional[list]:
     return None
 
 
-def _handle_qwen3_prompt_suffix_thinking(request: Any, qwen3_enable_prompt_suffix_thinking: bool) -> None:
+def _handle_qwen3_prompt_suffix_thinking(
+    request: Any, qwen3_enable_prompt_suffix_thinking: bool
+) -> None:
     """
     Handle Qwen3 thinking logic based on model name and enable flag (soft switch).
     Default behavior: no thinking mode unless model name ends with '-think'.
-    
+
     Args:
         request: The request object to modify
         qwen3_enable_prompt_suffix_thinking: Whether prompt suffix thinking is enabled
@@ -301,13 +309,21 @@ def _handle_qwen3_prompt_suffix_thinking(request: Any, qwen3_enable_prompt_suffi
             return
 
         # Ensure request has required attributes
-        if not hasattr(request, "messages") or not request.messages or not isinstance(request.messages, list):
-            logger.debug("Request missing valid messages, skipping qwen3 prompt suffix thinking")
+        if (
+            not hasattr(request, "messages")
+            or not request.messages
+            or not isinstance(request.messages, list)
+        ):
+            logger.debug(
+                "Request missing valid messages, skipping qwen3 prompt suffix thinking"
+            )
             return
 
         # Ensure request has model attribute
         if not hasattr(request, "model") or not request.model:
-            logger.debug("Request missing model name, skipping qwen3 prompt suffix thinking")
+            logger.debug(
+                "Request missing model name, skipping qwen3 prompt suffix thinking"
+            )
             return
 
         last_message = request.messages[-1]
@@ -319,18 +335,22 @@ def _handle_qwen3_prompt_suffix_thinking(request: Any, qwen3_enable_prompt_suffi
 
         content = last_message["content"]
         model_name = request.model
-        
+
         # Check if model name ends with '-think' (enable thinking)
         _enable_think = model_name.endswith("-think")
-        
+
         if _enable_think:
             # Remove '-think' suffix from model name for actual model lookup
             request.model = model_name.rstrip("-think")
-            logger.debug(f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled)")
-        
+            logger.debug(
+                f"Model name changed from '{model_name}' to '{request.model}' (thinking enabled)"
+            )
+
         # Check if content already has thinking tags to avoid duplication
         if THINKING_TAG_REGEX.search(content):
-            logger.debug("Content already contains thinking tags, skipping modification")
+            logger.debug(
+                "Content already contains thinking tags, skipping modification"
+            )
             return
 
         # Add appropriate thinking tag based on model name
@@ -340,7 +360,9 @@ def _handle_qwen3_prompt_suffix_thinking(request: Any, qwen3_enable_prompt_suffi
         else:
             # Default behavior: explicitly disable thinking for non-think models
             last_message["content"] += " /no_think"
-            logger.debug("Added '/no_think' suffix to prompt (thinking disabled by default)")
+            logger.debug(
+                "Added '/no_think' suffix to prompt (thinking disabled by default)"
+            )
 
     except Exception as e:
         logger.debug(f"Error processing qwen3 prompt suffix thinking: {e}")
@@ -349,10 +371,10 @@ def _handle_qwen3_prompt_suffix_thinking(request: Any, qwen3_enable_prompt_suffi
 async def patch_check_model(request: Any) -> Optional[JSONResponse]:
     """
     Patch for check_model in versions < 0.6.2
-    
+
     Args:
         request: The request object to check and modify
-        
+
     Returns:
         Optional JSONResponse if model check fails
     """
@@ -367,11 +389,11 @@ async def patch_check_model(request: Any) -> Optional[JSONResponse]:
 async def patch_check_model_v2(self: Any, request: Any) -> Optional[JSONResponse]:
     """
     Patch for check_model in versions >= 0.6.2
-    
+
     Args:
         self: The serving instance
         request: The request object to check and modify
-        
+
     Returns:
         Optional JSONResponse if model check fails
     """
@@ -380,14 +402,16 @@ async def patch_check_model_v2(self: Any, request: Any) -> Optional[JSONResponse
     return ret
 
 
-async def origin_serving_self_check_model(self: Any, request: Any) -> Optional[JSONResponse]:
+async def origin_serving_self_check_model(
+    self: Any, request: Any
+) -> Optional[JSONResponse]:
     """
     Original serving model check implementation
-    
+
     Args:
         self: The serving instance
         request: The request object to check
-        
+
     Returns:
         Optional JSONResponse if model check fails
     """
@@ -407,14 +431,16 @@ async def origin_serving_self_check_model(self: Any, request: Any) -> Optional[J
     )
 
 
-async def patch_serving_self_check_model(self: Any, request: Any) -> Optional[JSONResponse]:
+async def patch_serving_self_check_model(
+    self: Any, request: Any
+) -> Optional[JSONResponse]:
     """
     Patch for serving model check
-    
+
     Args:
         self: The serving instance
         request: The request object to check and modify
-        
+
     Returns:
         Optional JSONResponse if model check fails
     """
@@ -449,10 +475,10 @@ def parse_stop_string(stop_str: str) -> Union[str, List[str]]:
 def patch_make_arg_parser(*args: Any) -> Any:
     """
     Add custom arguments to the argument parser
-    
+
     Args:
         *args: Arguments passed to the original make_arg_parser
-        
+
     Returns:
         The modified argument parser
     """
@@ -501,8 +527,8 @@ def patch_make_arg_parser(*args: Any) -> Any:
         action="store_true",
         default=False,
         help="Enable Qwen3 thinking mode by appending `/think` or `/nothink` suffix to the prompt (soft switch). "
-             "When enabled, models ending with '-think' will automatically append '/think', "
-             "while other models will append '/no_think'. Default: off."
+        "When enabled, models ending with '-think' will automatically append '/think', "
+        "while other models will append '/no_think'. Default: off.",
     )
 
     parser.add_argument(
@@ -510,10 +536,10 @@ def patch_make_arg_parser(*args: Any) -> Any:
         action="store_true",
         default=False,
         help="Enable Qwen3 chat template thinking mode (hard switch). "
-             "When enabled, it will modify the system prompt template directly "
-             "if chat_template_kwargs.enable_thinking is not specified in the request. "
-             "This provides stronger constraints than the soft switch. "
-             "Mutually exclusive with --qwen3-enable-prompt-suffix-thinking. Default: off."
+        "When enabled, it will modify the system prompt template directly "
+        "if chat_template_kwargs.enable_thinking is not specified in the request. "
+        "This provides stronger constraints than the soft switch. "
+        "Mutually exclusive with --qwen3-enable-prompt-suffix-thinking. Default: off.",
     )
 
     return parser
@@ -522,12 +548,12 @@ def patch_make_arg_parser(*args: Any) -> Any:
 def _patch_parse_args(self: Any, *args: Any, **kwargs: Any) -> Any:
     """
     Patch for argument parsing with context storage
-    
+
     Args:
         self: The parser instance
         *args: Arguments passed to parse_args
         **kwargs: Keyword arguments passed to parse_args
-        
+
     Returns:
         Parsed arguments
     """
@@ -552,20 +578,28 @@ def _patch_parse_args(self: Any, *args: Any, **kwargs: Any) -> Any:
     return parsed_args
 
 
-def _apply_default_list_value(request: Any, attr_name: str, default_value: Union[str, List[str]]) -> None:
+def _apply_default_list_value(
+    request: Any, attr_name: str, default_value: Union[str, List[str]]
+) -> None:
     """
     Apply default value to request attribute if not present or empty
-    
+
     Args:
         request: The request object to modify
         attr_name: The attribute name to set
         default_value: The default value to apply
     """
     if not hasattr(request, attr_name) or not getattr(request, attr_name):
-        setattr(request, attr_name, default_value if isinstance(default_value, list) else [default_value])
+        setattr(
+            request,
+            attr_name,
+            default_value if isinstance(default_value, list) else [default_value],
+        )
     else:
         current_values = getattr(request, attr_name)
-        current_list = current_values if isinstance(current_values, list) else [current_values]
+        current_list = (
+            current_values if isinstance(current_values, list) else [current_values]
+        )
         new_list = default_value if isinstance(default_value, list) else [default_value]
         setattr(request, attr_name, current_list + new_list)
 
@@ -637,6 +671,7 @@ def patch_api_server() -> None:
 
     if origin_check_model and vllm_version_magic.less_than_0_6_2():
         from vllm.entrypoints.openai import api_server
+
         api_server.origin_check_model = origin_check_model
         api_server.check_model = patch_check_model
 
@@ -654,7 +689,7 @@ def patch_api_server() -> None:
     cli_args.make_arg_parser = patch_make_arg_parser
     for name, module in sys.modules.items():
         if name.startswith("vllm") and hasattr(module, "make_arg_parser"):
-        # if name.startswith("vllm.entrypoints.openai.cli_args") and hasattr(module, "make_arg_parser"):
+            # if name.startswith("vllm.entrypoints.openai.cli_args") and hasattr(module, "make_arg_parser"):
             setattr(module, "make_arg_parser", patch_make_arg_parser)
 
 
