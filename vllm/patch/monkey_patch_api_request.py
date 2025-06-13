@@ -359,9 +359,8 @@ def patch_api_server() -> None:
     except ImportError:
         origin_check_model = None
 
-    from vllm.entrypoints.openai import api_server
-
     if origin_check_model and vllm_version_magic.less_than_0_6_2():
+        from vllm.entrypoints.openai import api_server
         api_server.origin_check_model = origin_check_model
         api_server.check_model = patch_check_model
 
@@ -377,8 +376,8 @@ def patch_api_server() -> None:
         FlexibleArgumentParser.parse_args = _patch_parse_args
 
     cli_args.make_arg_parser = patch_make_arg_parser
-    for module in sys.modules.values():
-        if hasattr(module, "make_arg_parser"):
+    for name, module in sys.modules.items():
+        if name.startswith("vllm.entrypoints.openai.cli_args") and hasattr(module, "make_arg_parser"):
             setattr(module, "make_arg_parser", patch_make_arg_parser)
 
 
