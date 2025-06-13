@@ -2,6 +2,7 @@ import sys
 import json
 import base64
 import logging
+import re
 
 from typing import Optional
 from vllm import __version__ as vllm_version
@@ -26,6 +27,10 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+# Compile the regex for checking /think or /nothink at the end of the string
+THINKING_TAG_REGEX = re.compile(r"/(think|nothink||no_think)\s*$")
 
 
 class VllmVersionMagic:
@@ -133,6 +138,61 @@ def get_continuous_usage_stats_status() -> bool:
 
 
 @cache
+def get_qwen3_prompt_suffix_thinking_status() -> bool:
+    """Get qwen3_enable_prompt_suffix_thinking status from CLI arguments"""
+    args = cliContext.args
+    if not args:
+        return False
+    return getattr(args, "qwen3_enable_prompt_suffix_thinking", False)
+
+
+@cache
+def get_qwen3_chat_template_thinking_status() -> bool:
+    """Get qwen3_enable_chat_template_thinking status from CLI arguments"""
+    args = cliContext.args
+    if not args:
+        return False
+    return getattr(args, "qwen3_enable_chat_template_thinking", False)
+
+
+@cache
+def get_qwen3_chat_template_thinking_status() -> bool:
+    """Get qwen3_enable_chat_template_thinking status from CLI arguments"""
+    args = cliContext.args
+    if not args:
+        return False
+    return getattr(args, "qwen3_enable_chat_template_thinking", False)
+
+
+def _handle_qwen3_chat_template_thinking(request) -> None:
+    """Handle Qwen3 chat template thinking logic (hard switch)."""
+    if not hasattr(request, "chat_template_kwargs"):
+        return
+    
+    if not hasattr(request.chat_template_kwargs, "enable_thinking"):
+        request.chat_template_kwargs.enable_thinking = True
+        logger.debug("Applied Qwen3 chat template thinking (hard switch)")
+
+
+def handle_qwen3_thinking_modes(request) -> None:
+    """
+    Handle all Qwen3 thinking mode logic (both hard and soft switches).
+    Enforces mutual exclusion between different thinking modes.
+    """
+    qwen3_chat_template_thinking = get_qwen3_chat_template_thinking_status()
+    qwen3_prompt_suffix_thinking = get_qwen3_prompt_suffix_thinking_status()
+    
+    if qwen3_chat_template_thinking and qwen3_prompt_suffix_thinking:
+        logger.warning("Both Qwen3 thinking modes enabled, using hard switch only")
+        qwen3_prompt_suffix_thinking = False
+
+    if qwen3_chat_template_thinking:
+        _handle_qwen3_chat_template_thinking(request)
+    elif qwen3_prompt_suffix_thinking:
+        _handle_qwen3_prompt_suffix_thinking(request, qwen3_prompt_suffix_thinking)
+
+
+@cache
 def get_default_stop() -> Optional[Union[str, List[str]]]:
     """
     Get default stop from CLI arguments.
@@ -176,20 +236,57 @@ def get_default_stop_token_ids() -> Optional[list]:
     return None
 
 
+def _handle_qwen3_prompt_suffix_thinking(request, qwen3_enable_prompt_suffix_thinking):
+    """Handle Qwen3 thinking logic based on model name and enable flag."""
+    try:
+        # If qwen3 prompt suffix thinking is not enabled, return
+        if not qwen3_enable_prompt_suffix_thinking:
+            return
+
+        # Ensure messages exist and is a list
+        if not hasattr(request, "messages") or not request.messages or not isinstance(request.messages, list):
+            return
+
+        last_message = request.messages[-1]
+
+        # Ensure the last message is a dictionary and has content
+        if not isinstance(last_message, dict) or "content" not in last_message:
+            return
+
+        content = last_message["content"]
+        model_name = request.model
+        _enable_think = True if model_name.endswith("-think") else False
+        if _enable_think:
+            #   # Patch SubCliServe
+            request.model = model_name.rstrip("-think")
+        # Check if content already ends with /think or /nothink followed by optional whitespace
+        if THINKING_TAG_REGEX.search(content):
+            return
+
+        # Determine the tag to add based on model name
+        if _enable_think:
+            last_message["content"] += " /think"
+        else:
+            last_message["content"] += " /no_think"
+
+    except Exception as e:
+        logger.error(f"Error processing qwen3 prompt suffix thinking: {e}")
+
+
 async def patch_check_model(request) -> Optional[JSONResponse]:
     """Patch for check_model in versions < 0.6.2"""
     if version.parse(vllm_version) < version.parse("0.6.2"):
         from vllm.entrypoints.openai.api_server import origin_check_model
 
-    ret = await origin_check_model(request)
     reset_default_request(request=request)
+    ret = await origin_check_model(request)
     return ret
 
 
 async def patch_check_model_v2(self, request):
     """Patch for check_model in versions >= 0.6.2"""
-    ret = await self.origin_check_model(request)
     reset_default_request(request=request)
+    ret = await self.origin_check_model(request)
     return ret
 
 
@@ -213,8 +310,8 @@ async def origin_serving_self_check_model(self, request):
 
 async def patch_serving_self_check_model(self, request):
     """Patch for serving model check"""
-    ret = await self.origin_serving_check_model(request)
     reset_default_request(request=request)
+    ret = await self.origin_serving_check_model(request)
     return ret
 
 
@@ -282,6 +379,26 @@ def patch_make_arg_parser(*args):
         help="Comma separated stop token ids (e.g. '151643,151645')",
     )
 
+    parser.add_argument(
+        "--qwen3-enable-prompt-suffix-thinking",
+        action="store_true",
+        default=False,
+        help="Enable Qwen3 thinking mode by appending `/think` or `/nothink` suffix to the prompt (soft switch). "
+             "When enabled, models ending with '-think' will automatically append '/think', "
+             "while other models will append '/no_think'. Default: off."
+    )
+
+    parser.add_argument(
+        "--qwen3-enable-chat-template-thinking",
+        action="store_true",
+        default=False,
+        help="Enable Qwen3 chat template thinking mode (hard switch). "
+             "When enabled, it will modify the system prompt template directly "
+             "if chat_template_kwargs.enable_thinking is not specified in the request. "
+             "This provides stronger constraints than the soft switch. "
+             "Mutually exclusive with --qwen3-enable-prompt-suffix-thinking. Default: off."
+    )
+
     return parser
 
 
@@ -326,6 +443,9 @@ def reset_default_request(request) -> None:
             request.stream_options = StreamOptions(
                 include_usage=True, continuous_usage_stats=continuous_usage_stats
             )
+
+    # Handle Qwen3 thinking modes
+    handle_qwen3_thinking_modes(request)
 
     default_model_template = get_default_model_template()
     if default_model_template:
