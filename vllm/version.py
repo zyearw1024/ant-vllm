@@ -2,13 +2,8 @@
 
 # Hardcoded version number
 __version__ = "0.8.5.post1"
-# Parse version string into tuple
-__version_parts = __version__.split('.')
-if len(__version_parts) >= 3 and 'post' in __version_parts[2]:
-    post_parts = __version_parts[2].split('post')
-    __version_tuple__ = (int(__version_parts[0]), int(__version_parts[1]), int(post_parts[0]), int(post_parts[1]))
-else:
-    __version_tuple__ = tuple(int(part) for part in __version_parts)
+# Hardcoded version tuple
+__version_tuple__ = (0, 8, 5, 1)
 
 
 def _prev_minor_version_was(version_str):
